@@ -1,0 +1,1975 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+<title>دفتري - نظام محاسبي</title>
+<link rel="icon" href="data:,">
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+  html, body { margin: 0; padding: 0; background: #14171c; }
+  #root { min-height: 100vh; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useMemo, useCallback, useRef } = React;
+
+/* ---------------------------------------------------------------
+   بديل تخزين المتصفح (localStorage) يطابق نفس واجهة window.storage
+   المستخدمة بنسخة Claude، حتى يشتغل نفس الكود بدون تعديل
+----------------------------------------------------------------*/
+window.storage = {
+  get: async (key) => {
+    const raw = localStorage.getItem(key);
+    if (raw === null) throw new Error("not found");
+    return { key, value: raw };
+  },
+  set: async (key, value) => {
+    localStorage.setItem(key, value);
+    return { key, value };
+  },
+  delete: async (key) => {
+    localStorage.removeItem(key);
+    return { key, deleted: true };
+  },
+  list: async (prefix) => {
+    const keys = Object.keys(localStorage).filter((k) => !prefix || k.startsWith(prefix));
+    return { keys, prefix };
+  },
+};
+
+/* ---------------------------------------------------------------
+   ايقونات بسيطة (بدل مكتبة lucide-react الغير متوفرة هنا)
+----------------------------------------------------------------*/
+function Icon({ glyph, size = 16, className = "" }) {
+  return (
+    <span className={className} style={{ fontSize: size, lineHeight: 1, display: "inline-block" }}>
+      {glyph}
+    </span>
+  );
+}
+const Home = (p) => <Icon glyph="\u2302" {...p} />;
+const BookOpen = (p) => <Icon glyph="\uD83D\uDCD6" {...p} />;
+const ListTree = (p) => <Icon glyph="\uD83C\uDF33" {...p} />;
+const NotebookText = (p) => <Icon glyph="\uD83D\uDCDD" {...p} />;
+const Scale = (p) => <Icon glyph="\u2696" {...p} />;
+const FileBarChart2 = (p) => <Icon glyph="\uD83D\uDCCA" {...p} />;
+const Percent = (p) => <Icon glyph="%" {...p} />;
+const Plus = (p) => <Icon glyph="+" {...p} />;
+const Trash2 = (p) => <Icon glyph="\uD83D\uDDD1" {...p} />;
+const X = (p) => <Icon glyph="\u2715" {...p} />;
+const AlertCircle = (p) => <Icon glyph="\u26A0" {...p} />;
+const CheckCircle2 = (p) => <Icon glyph="\u2713" {...p} />;
+const RotateCcw = (p) => <Icon glyph="\u21BA" {...p} />;
+const Loader2 = (p) => <Icon glyph="\u23F3" {...p} />;
+const Tags = (p) => <Icon glyph="\uD83C\uDFF7" {...p} />;
+const DownloadCloud = (p) => <Icon glyph="\u2913" {...p} />;
+const Download = (p) => <Icon glyph="\u2B07" {...p} />;
+const Upload = (p) => <Icon glyph="\u2B06" {...p} />;
+
+
+/* ---------------------------------------------------------------
+   ثوابت النظام المحاسبي
+----------------------------------------------------------------*/
+const STORAGE_KEY = "mohammed-accounting-data-v1";
+const CURRENCIES = ["IQD", "USD", "EUR"];
+
+const ACCOUNT_TYPES = {
+  asset:     { label: "اصول",          normal: "debit",  hasCurrent: true  },
+  liability: { label: "خصوم",          normal: "credit", hasCurrent: true  },
+  equity:    { label: "حقوق ملكية",     normal: "credit", hasCurrent: false },
+  revenue:   { label: "ايرادات",        normal: "credit", hasCurrent: false },
+  expense:   { label: "مصاريف",         normal: "debit",  hasCurrent: false },
+};
+
+const TYPE_ORDER = ["asset", "liability", "equity", "revenue", "expense"];
+
+const ASSET_SUBTYPES = {
+  cash:       "نقدية وما يعادلها",
+  receivable: "ذمم مدينة",
+  inventory:  "مخزون",
+  other:      "اخرى",
+};
+
+const EXPENSE_SUBTYPES = {
+  cogs:      "تكلفة البضاعة المباعة",
+  operating: "مصاريف تشغيلية",
+  other:     "مصاريف غير تشغيلية (تمويل)",
+  tax:       "ضريبة الدخل",
+};
+
+const REVENUE_SUBTYPES = {
+  operating: "ايرادات تشغيلية",
+  other:     "ايرادات غير تشغيلية (متفرقة)",
+};
+
+/* دليل حسابات شامل مبني على تصنيف المعايير الدولية لاعداد التقارير المالية IFRS
+   (تبويب اصول متداولة/غير متداولة، التزامات متداولة/غير متداولة، حقوق ملكية،
+   ايرادات ومصاريف تشغيلية وغير تشغيلية، فصل تكلفة المبيعات). الترقيم نفسه تصميم
+   عملي وليس رقم رسمي ملزم — IFRS يحدد التبويب والعرض وليس ارقام الحسابات.
+   ملاحظة: حسابات "مقابل/مخصص" (مثل مجمع الاستهلاك) مقيدة بعكس الحساب الاصلي
+   فتطرح نفسها تلقائيا من المجموع، فلا تحتاج معاملة خاصة. */
+const STANDARD_ACCOUNTS = [
+  // الاصول المتداولة
+  { code: "1000", name: "الصندوق",                          type: "asset", current: true,  subType: "cash" },
+  { code: "1010", name: "البنك - حساب جاري",                 type: "asset", current: true,  subType: "cash" },
+  { code: "1020", name: "البنك - حساب توفير",                type: "asset", current: true,  subType: "cash" },
+  { code: "1030", name: "استثمارات قصيرة الاجل",             type: "asset", current: true,  subType: "other" },
+  { code: "1100", name: "ذمم مدينة - عملاء",                  type: "asset", current: true,  subType: "receivable" },
+  { code: "1110", name: "مخصص ديون مشكوك بتحصيلها",          type: "asset", current: true,  subType: "receivable" },
+  { code: "1120", name: "اوراق قبض",                         type: "asset", current: true,  subType: "receivable" },
+  { code: "1200", name: "مخزون بضاعة جاهزة",                  type: "asset", current: true,  subType: "inventory" },
+  { code: "1210", name: "مخزون مواد اولية",                  type: "asset", current: true,  subType: "inventory" },
+  { code: "1300", name: "مصاريف مدفوعة مقدما",                type: "asset", current: true,  subType: "other" },
+  { code: "1310", name: "سلف وعهد موظفين",                   type: "asset", current: true,  subType: "other" },
+  { code: "1320", name: "ضريبة مدخلات قابلة للاسترداد",        type: "asset", current: true,  subType: "other" },
+
+  // الاصول غير المتداولة
+  { code: "1500", name: "اراضي",                             type: "asset", current: false, subType: "other" },
+  { code: "1510", name: "مباني",                             type: "asset", current: false, subType: "other" },
+  { code: "1520", name: "اثاث وتجهيزات مكتبية",               type: "asset", current: false, subType: "other" },
+  { code: "1530", name: "سيارات ووسائط نقل",                  type: "asset", current: false, subType: "other" },
+  { code: "1540", name: "معدات وآلات",                       type: "asset", current: false, subType: "other" },
+  { code: "1590", name: "مجمع استهلاك الموجودات الثابتة",      type: "asset", current: false, subType: "other" },
+  { code: "1600", name: "اصول غير ملموسة - برامج وتراخيص",     type: "asset", current: false, subType: "other" },
+  { code: "1690", name: "مجمع اطفاء الموجودات غير الملموسة",   type: "asset", current: false, subType: "other" },
+  { code: "1700", name: "استثمارات طويلة الاجل",              type: "asset", current: false, subType: "other" },
+
+  // الالتزامات المتداولة
+  { code: "2000", name: "ذمم دائنة - موردين",                 type: "liability", current: true,  subType: "" },
+  { code: "2010", name: "اوراق دفع",                         type: "liability", current: true,  subType: "" },
+  { code: "2020", name: "رواتب واجور مستحقة",                 type: "liability", current: true,  subType: "" },
+  { code: "2030", name: "ضريبة الدخل مستحقة",                 type: "liability", current: true,  subType: "" },
+  { code: "2040", name: "ضريبة المبيعات / القيمة المضافة مستحقة", type: "liability", current: true,  subType: "" },
+  { code: "2050", name: "دفعات مقبوضة مقدما من عملاء",        type: "liability", current: true,  subType: "" },
+  { code: "2060", name: "قروض قصيرة الاجل",                  type: "liability", current: true,  subType: "" },
+
+  // الالتزامات غير المتداولة
+  { code: "2500", name: "قروض طويلة الاجل",                   type: "liability", current: false, subType: "" },
+  { code: "2520", name: "التزامات عقود ايجار طويلة الاجل",     type: "liability", current: false, subType: "" },
+  { code: "2530", name: "مخصص تعويض نهاية الخدمة",            type: "liability", current: false, subType: "" },
+
+  // حقوق الملكية
+  { code: "3000", name: "رأس المال المدفوع",                  type: "equity", current: false, subType: "" },
+  { code: "3200", name: "احتياطي قانوني",                    type: "equity", current: false, subType: "" },
+  { code: "3300", name: "ارباح مرحلة (محتجزة)",               type: "equity", current: false, subType: "" },
+  { code: "3900", name: "سحوبات / توزيعات ارباح",             type: "equity", current: false, subType: "" },
+
+  // الايرادات
+  { code: "4000", name: "ايرادات المبيعات",                   type: "revenue", current: false, subType: "operating", group: "sales" },
+  { code: "4010", name: "ايرادات تقديم خدمات",                type: "revenue", current: false, subType: "operating", group: "service" },
+  { code: "4090", name: "مردودات ومسموحات المبيعات",          type: "revenue", current: false, subType: "operating", group: "sales" },
+  { code: "4095", name: "الخصم المسموح به",                   type: "revenue", current: false, subType: "operating", group: "sales" },
+  { code: "4100", name: "ايرادات فوائد بنكية",                type: "revenue", current: false, subType: "other" },
+  { code: "4110", name: "ارباح فروقات صرف عملة",              type: "revenue", current: false, subType: "other" },
+  { code: "4120", name: "ايرادات اخرى متنوعة",                type: "revenue", current: false, subType: "other" },
+
+  // تكلفة المبيعات
+  { code: "5000", name: "تكلفة البضاعة المباعة",              type: "expense", current: false, subType: "cogs" },
+
+  // المصاريف التشغيلية
+  { code: "6000", name: "رواتب واجور - اداري وعمومي",         type: "expense", current: false, subType: "operating" },
+  { code: "6010", name: "ايجار",                            type: "expense", current: false, subType: "operating" },
+  { code: "6020", name: "كهرباء وماء",                       type: "expense", current: false, subType: "operating" },
+  { code: "6030", name: "اتصالات وانترنت",                   type: "expense", current: false, subType: "operating" },
+  { code: "6040", name: "قرطاسية ومستلزمات مكتبية",          type: "expense", current: false, subType: "operating" },
+  { code: "6050", name: "صيانة",                            type: "expense", current: false, subType: "operating" },
+  { code: "6060", name: "تسويق واعلان",                      type: "expense", current: false, subType: "operating" },
+  { code: "6070", name: "نقل ومواصلات",                      type: "expense", current: false, subType: "operating" },
+  { code: "6080", name: "استهلاك الموجودات الثابتة",          type: "expense", current: false, subType: "operating" },
+  { code: "6090", name: "اطفاء الموجودات غير الملموسة",       type: "expense", current: false, subType: "operating" },
+  { code: "6100", name: "مصاريف وعمولات بنكية",               type: "expense", current: false, subType: "operating" },
+  { code: "6110", name: "مصاريف اخرى تشغيلية",                type: "expense", current: false, subType: "operating" },
+
+  // مصاريف غير تشغيلية (تمويل وضريبة)
+  { code: "7000", name: "مصاريف فوائد (تمويل)",               type: "expense", current: false, subType: "other" },
+  { code: "7020", name: "خسائر فروقات صرف عملة",              type: "expense", current: false, subType: "other" },
+  { code: "7030", name: "ضريبة الدخل (مصروف الضريبة)",        type: "expense", current: false, subType: "tax" },
+];
+
+const SEED_ACCOUNTS = STANDARD_ACCOUNTS.map((a) => ({ ...a, id: uid() }));
+
+function uid() {
+  return Math.random().toString(36).slice(2, 10);
+}
+const todayStr = () => new Date().toISOString().slice(0, 10);
+
+function fmt(n) {
+  const v = Number(n) || 0;
+  return v.toLocaleString("en-US", { maximumFractionDigits: 0 });
+}
+
+function getUsedAccountIds(entries) {
+  const used = new Set();
+  entries.forEach((e) => e.lines.forEach((l) => l.accountId && used.add(l.accountId)));
+  return used;
+}
+
+function Num({ value, className = "" }) {
+  return <span className={`num ${className}`}>{fmt(value)}</span>;
+}
+
+/* ---------------------------------------------------------------
+   حسابات مساعدة — كل المبالغ تتحول لمعادلها بالدينار العراقي (IQD)
+   باستخدام سعر الصرف المسجل بكل قيد
+----------------------------------------------------------------*/
+function computeBalances(accounts, entries) {
+  const totals = {};
+  accounts.forEach((a) => (totals[a.id] = { debit: 0, credit: 0 }));
+  entries.forEach((e) => {
+    const rate = Number(e.exchangeRate) || 1;
+    e.lines.forEach((l) => {
+      if (!totals[l.accountId]) return;
+      totals[l.accountId].debit += (Number(l.debit) || 0) * rate;
+      totals[l.accountId].credit += (Number(l.credit) || 0) * rate;
+    });
+  });
+  const balances = {};
+  accounts.forEach((a) => {
+    const t = totals[a.id] || { debit: 0, credit: 0 };
+    const normal = ACCOUNT_TYPES[a.type].normal;
+    const net = normal === "debit" ? t.debit - t.credit : t.credit - t.debit;
+    balances[a.id] = { ...t, net };
+  });
+  return balances;
+}
+
+/* ---------------------------------------------------------------
+   المكون الرئيسي
+----------------------------------------------------------------*/
+function AccountingApp() {
+  const [accounts, setAccounts] = useState([]);
+  const [entries, setEntries] = useState([]);
+  const [costCenters, setCostCenters] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [tab, setTab] = useState("home");
+  const [toast, setToast] = useState(null);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await window.storage.get(STORAGE_KEY, false);
+        const data = JSON.parse(res.value);
+        setAccounts(data.accounts || []);
+        setEntries(data.entries || []);
+        setCostCenters(data.costCenters || []);
+      } catch {
+        setAccounts(SEED_ACCOUNTS);
+        setEntries([]);
+        setCostCenters([]);
+        try {
+          await window.storage.set(
+            STORAGE_KEY,
+            JSON.stringify({ accounts: SEED_ACCOUNTS, entries: [], costCenters: [] }),
+            false
+          );
+        } catch {}
+      } finally {
+        setLoading(false);
+      }
+    })();
+  }, []);
+
+  const persist = useCallback(async (nextAccounts, nextEntries, nextCostCenters) => {
+    try {
+      await window.storage.set(
+        STORAGE_KEY,
+        JSON.stringify({ accounts: nextAccounts, entries: nextEntries, costCenters: nextCostCenters }),
+        false
+      );
+    } catch {
+      showToast("صار خطأ بحفظ البيانات", "error");
+    }
+  }, []);
+
+  const showToast = (msg, kind = "ok") => {
+    setToast({ msg, kind });
+    setTimeout(() => setToast(null), 2500);
+  };
+
+  const addAccount = (acc) => {
+    const next = [...accounts, { ...acc, id: uid() }].sort((a, b) =>
+      a.code.localeCompare(b.code, "en", { numeric: true })
+    );
+    setAccounts(next);
+    persist(next, entries, costCenters);
+    showToast("تمت اضافة الحساب");
+  };
+
+  const addStandardAccounts = () => {
+    const existingCodes = new Set(accounts.map((a) => a.code));
+    const toAdd = STANDARD_ACCOUNTS.filter((a) => !existingCodes.has(a.code)).map((a) => ({
+      ...a,
+      id: uid(),
+    }));
+    if (toAdd.length === 0) {
+      showToast("الدليل القياسي موجود عندك مسبقا");
+      return;
+    }
+    const next = [...accounts, ...toAdd].sort((a, b) =>
+      a.code.localeCompare(b.code, "en", { numeric: true })
+    );
+    setAccounts(next);
+    persist(next, entries, costCenters);
+    showToast(`تمت اضافة ${toAdd.length} حساب جديد`);
+  };
+
+  const deleteAccount = (id) => {
+    const used = entries.some((e) => e.lines.some((l) => l.accountId === id));
+    if (used) {
+      showToast("ما تكدر تحذف حساب مستخدم بقيود", "error");
+      return;
+    }
+    const next = accounts.filter((a) => a.id !== id);
+    setAccounts(next);
+    persist(next, entries, costCenters);
+  };
+
+  const addEntry = (entry) => {
+    const next = [...entries, { ...entry, id: uid() }];
+    setEntries(next);
+    persist(accounts, next, costCenters);
+    showToast("تم حفظ القيد");
+  };
+
+  const deleteEntry = (id) => {
+    const next = entries.filter((e) => e.id !== id);
+    setEntries(next);
+    persist(accounts, next, costCenters);
+  };
+
+  const addCostCenter = (name) => {
+    const next = [...costCenters, { id: uid(), name }];
+    setCostCenters(next);
+    persist(accounts, entries, next);
+  };
+
+  const deleteCostCenter = (id) => {
+    const next = costCenters.filter((c) => c.id !== id);
+    setCostCenters(next);
+    persist(accounts, entries, next);
+  };
+
+  const resetAll = async () => {
+    if (!window.confirm("متأكد تريد تصفر كل البيانات؟ هذا الاجراء ما ينرجع")) return;
+    setAccounts(SEED_ACCOUNTS);
+    setEntries([]);
+    setCostCenters([]);
+    await persist(SEED_ACCOUNTS, [], []);
+    showToast("تم تصفير البيانات");
+  };
+
+  const fileInputRef = useRef(null);
+
+  const exportBackup = () => {
+    const payload = { accounts, entries, costCenters, exportedAt: new Date().toISOString() };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `نسخة-احتياطية-دفتري-${todayStr()}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    showToast("تم تنزيل النسخة الاحتياطية");
+  };
+
+  const triggerImport = () => fileInputRef.current?.click();
+
+  const onImportFile = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = async (ev) => {
+      try {
+        const data = JSON.parse(ev.target.result);
+        if (!Array.isArray(data.accounts) || !Array.isArray(data.entries)) {
+          throw new Error("invalid file");
+        }
+        if (!window.confirm("استيراد هذا الملف راح يستبدل كل بياناتك الحالية بالتطبيق متأكد؟")) return;
+        const nextAccounts = data.accounts;
+        const nextEntries = data.entries;
+        const nextCostCenters = data.costCenters || [];
+        setAccounts(nextAccounts);
+        setEntries(nextEntries);
+        setCostCenters(nextCostCenters);
+        await persist(nextAccounts, nextEntries, nextCostCenters);
+        showToast("تم استيراد النسخة الاحتياطية بنجاح");
+      } catch {
+        showToast("الملف غير صالح تأكد انه نفس صيغة التصدير", "error");
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = "";
+  };
+
+  const balances = useMemo(() => computeBalances(accounts, entries), [accounts, entries]);
+
+  const totalsByType = useMemo(() => {
+    const t = {};
+    TYPE_ORDER.forEach((ty) => (t[ty] = 0));
+    accounts.forEach((a) => (t[a.type] += balances[a.id]?.net || 0));
+    return t;
+  }, [accounts, balances]);
+
+  const netIncome = totalsByType.revenue - totalsByType.expense;
+  const totalAssets = totalsByType.asset;
+  const totalLiabEquity = totalsByType.liability + totalsByType.equity + netIncome;
+  const isBalanced = Math.abs(totalAssets - totalLiabEquity) < 1;
+
+  const totalDebit = entries.reduce(
+    (s, e) =>
+      s + e.lines.reduce((s2, l) => s2 + (Number(l.debit) || 0) * (Number(e.exchangeRate) || 1), 0),
+    0
+  );
+
+  const NAV = [
+    { id: "home", label: "الرئيسية", icon: Home },
+    { id: "accounts", label: "الدليل المحاسبي", icon: ListTree },
+    { id: "journal", label: "القيود اليومية", icon: NotebookText },
+    { id: "ledger", label: "دفتر الاستاذ", icon: BookOpen },
+    { id: "trial", label: "ميزان المراجعة", icon: Scale },
+    { id: "statements", label: "القوائم المالية", icon: FileBarChart2 },
+    { id: "analytics", label: "التوزيع التحليلي", icon: Tags },
+    { id: "ratios", label: "التحليل المالي", icon: Percent },
+  ];
+
+  return (
+    <div className="app" dir="rtl">
+      <style>{CSS}</style>
+
+      {loading ? (
+        <div className="loading-screen">
+          <Loader2 className="spin" size={28} />
+          <span>جاري تحميل البيانات...</span>
+        </div>
+      ) : (
+        <>
+          <aside className="sidebar">
+            <div className="brand">
+              <span className="brand-mark">حـ</span>
+              <div className="brand-text">
+                <div className="brand-title">دفتري</div>
+                <div className="brand-sub">نسخة اولية</div>
+              </div>
+            </div>
+            <nav className="nav">
+              {NAV.map((n) => (
+                <button
+                  key={n.id}
+                  className={`nav-item ${tab === n.id ? "active" : ""}`}
+                  onClick={() => setTab(n.id)}
+                >
+                  <n.icon size={18} />
+                  <span>{n.label}</span>
+                </button>
+              ))}
+            </nav>
+            <button className="reset-btn" onClick={exportBackup}>
+              <Download size={14} /> تصدير نسخة احتياطية
+            </button>
+            <button className="reset-btn" onClick={triggerImport}>
+              <Upload size={14} /> استيراد نسخة احتياطية
+            </button>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="application/json"
+              style={{ display: "none" }}
+              onChange={onImportFile}
+            />
+            <button className="reset-btn danger" onClick={resetAll}>
+              <RotateCcw size={14} /> تصفير البيانات
+            </button>
+          </aside>
+
+          <main className="content">
+            {tab === "home" && (
+              <HomeTab
+                accounts={accounts}
+                entries={entries}
+                netIncome={netIncome}
+                isBalanced={isBalanced}
+                totalAssets={totalAssets}
+                totalLiabEquity={totalLiabEquity}
+                totalDebit={totalDebit}
+              />
+            )}
+            {tab === "accounts" && (
+              <AccountsTab
+                accounts={accounts}
+                balances={balances}
+                onAdd={addAccount}
+                onDelete={deleteAccount}
+                onAddStandard={addStandardAccounts}
+              />
+            )}
+            {tab === "journal" && (
+              <JournalTab
+                accounts={accounts}
+                entries={entries}
+                costCenters={costCenters}
+                onAdd={addEntry}
+                onDelete={deleteEntry}
+              />
+            )}
+            {tab === "ledger" && <LedgerTab accounts={accounts} entries={entries} />}
+            {tab === "trial" && <TrialBalanceTab accounts={accounts} balances={balances} entries={entries} />}
+            {tab === "statements" && (
+              <StatementsTab accounts={accounts} balances={balances} entries={entries} />
+            )}
+            {tab === "analytics" && (
+              <AnalyticsTab
+                accounts={accounts}
+                entries={entries}
+                costCenters={costCenters}
+                onAddCostCenter={addCostCenter}
+                onDeleteCostCenter={deleteCostCenter}
+              />
+            )}
+            {tab === "ratios" && (
+              <RatiosTab accounts={accounts} balances={balances} totalsByType={totalsByType} netIncome={netIncome} />
+            )}
+          </main>
+
+          {toast && (
+            <div className={`toast ${toast.kind}`}>
+              {toast.kind === "error" ? <AlertCircle size={16} /> : <CheckCircle2 size={16} />}
+              {toast.msg}
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------
+   الرئيسية
+----------------------------------------------------------------*/
+function HomeTab({ accounts, entries, netIncome, isBalanced, totalAssets, totalLiabEquity, totalDebit }) {
+  return (
+    <div className="page">
+      <h1 className="page-title">نظرة عامة</h1>
+      <p className="page-sub">ملخص سريع لوضع نظامك المحاسبي الحين (كل المبالغ بمعادلها بالدينار العراقي)</p>
+
+      <div className="stat-grid">
+        <StatCard label="عدد الحسابات" value={accounts.length} />
+        <StatCard label="عدد القيود" value={entries.length} />
+        <StatCard label="اجمالي حركة القيود" value={fmt(totalDebit)} suffix="د.ع" />
+        <StatCard
+          label="صافي الربح / الخسارة"
+          value={fmt(Math.abs(netIncome))}
+          suffix="د.ع"
+          tone={netIncome >= 0 ? "good" : "bad"}
+        />
+      </div>
+
+      <div className="card balance-check">
+        <div className="balance-check-row">
+          <span>الاصول</span>
+          <Num value={totalAssets} />
+        </div>
+        <div className="balance-check-row">
+          <span>الخصوم + حقوق الملكية + صافي الربح</span>
+          <Num value={totalLiabEquity} />
+        </div>
+        <div className={`balance-status ${isBalanced ? "ok" : "off"}`}>
+          {isBalanced ? (
+            <>
+              <CheckCircle2 size={16} /> الميزانية متوازنة
+            </>
+          ) : (
+            <>
+              <AlertCircle size={16} /> اكو فرق بين الطرفين راجع قيودك
+            </>
+          )}
+        </div>
+      </div>
+
+      <div className="card note-card backup-reminder">
+        نصيحة: هذي نسخة اولية والحفظ التلقائي تحت التجربة — اضغط "تصدير نسخة احتياطية" من القائمة الجانبية بعد كل جلسة عمل حتى ما تخسر بياناتك
+      </div>
+    </div>
+  );
+}
+
+function StatCard({ label, value, suffix, tone }) {
+  return (
+    <div className={`stat-card ${tone || ""}`}>
+      <div className="stat-value">
+        {value} {suffix && <span className="stat-suffix">{suffix}</span>}
+      </div>
+      <div className="stat-label">{label}</div>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------
+   الدليل المحاسبي
+----------------------------------------------------------------*/
+const SUBFILTER_DEFS = {
+  asset: [
+    { key: "all", label: "الكل", test: () => true },
+    { key: "cash", label: "نقدية", test: (a) => a.current && a.subType === "cash" },
+    { key: "receivable", label: "ذمم مدينة", test: (a) => a.current && a.subType === "receivable" },
+    { key: "inventory", label: "مخزون", test: (a) => a.current && a.subType === "inventory" },
+    { key: "other_current", label: "متداولة اخرى", test: (a) => a.current && a.subType === "other" },
+    { key: "noncurrent", label: "غير متداولة", test: (a) => !a.current },
+  ],
+  liability: [
+    { key: "all", label: "الكل", test: () => true },
+    { key: "current", label: "متداولة", test: (a) => a.current },
+    { key: "noncurrent", label: "غير متداولة", test: (a) => !a.current },
+  ],
+  equity: [{ key: "all", label: "الكل", test: () => true }],
+  revenue: [
+    { key: "all", label: "الكل", test: () => true },
+    { key: "operating", label: "تشغيلية", test: (a) => a.subType === "operating" || !a.subType },
+    { key: "other", label: "غير تشغيلية", test: (a) => a.subType === "other" },
+  ],
+  expense: [
+    { key: "all", label: "الكل", test: () => true },
+    { key: "cogs", label: "تكلفة البضاعة", test: (a) => a.subType === "cogs" },
+    { key: "operating", label: "تشغيلية", test: (a) => a.subType === "operating" || !a.subType },
+    { key: "other", label: "غير تشغيلية (تمويل)", test: (a) => a.subType === "other" },
+    { key: "tax", label: "ضريبة الدخل", test: (a) => a.subType === "tax" },
+  ],
+};
+
+function AccountsTab({ accounts, balances, onAdd, onDelete, onAddStandard }) {
+  const [form, setForm] = useState({ code: "", name: "", type: "asset", current: false, subType: "" });
+  const [err, setErr] = useState("");
+  const [filterType, setFilterType] = useState("all");
+  const [subFilter, setSubFilter] = useState("all");
+
+  const chooseType = (t) => {
+    setFilterType(t);
+    setSubFilter("all");
+  };
+
+  const submit = (e) => {
+    e.preventDefault();
+    if (!form.code.trim() || !form.name.trim()) {
+      setErr("لازم تعبي الكود والاسم");
+      return;
+    }
+    if (accounts.some((a) => a.code === form.code.trim())) {
+      setErr("اكو حساب بنفس الكود موجود مسبقا");
+      return;
+    }
+    onAdd({ ...form, code: form.code.trim(), name: form.name.trim() });
+    setForm({ code: "", name: "", type: "asset", current: false, subType: "" });
+    setErr("");
+  };
+
+  const sortByCode = (list) => [...list].sort((a, b) => a.code.localeCompare(b.code, "en", { numeric: true }));
+
+  const typesToShow = filterType === "all" ? TYPE_ORDER : [filterType];
+
+  const renderAccountsTable = (list) => (
+    <table className="table">
+      <thead>
+        <tr>
+          <th>الكود</th>
+          <th>اسم الحساب</th>
+          <th>التصنيف</th>
+          <th>الرصيد الحالي (د.ع)</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {list.map((a) => (
+          <tr key={a.id}>
+            <td className="num">{a.code}</td>
+            <td>{a.name}</td>
+            <td className="muted">
+              {ACCOUNT_TYPES[a.type].hasCurrent
+                ? `${a.current ? "متداول" : "غير متداول"}${
+                    a.current && a.subType ? " · " + ASSET_SUBTYPES[a.subType] : ""
+                  }`
+                : a.type === "expense" && a.subType
+                ? EXPENSE_SUBTYPES[a.subType]
+                : a.type === "revenue" && a.subType
+                ? REVENUE_SUBTYPES[a.subType]
+                : "—"}
+            </td>
+            <td>
+              <Num value={balances[a.id]?.net || 0} />
+            </td>
+            <td>
+              <button className="icon-btn" onClick={() => onDelete(a.id)} title="حذف">
+                <Trash2 size={15} />
+              </button>
+            </td>
+          </tr>
+        ))}
+        {list.length === 0 && (
+          <tr>
+            <td colSpan={5} className="empty">ماكو حسابات بهذا التصنيف</td>
+          </tr>
+        )}
+      </tbody>
+    </table>
+  );
+
+  return (
+    <div className="page">
+      <div className="page-head-row">
+        <div>
+          <h1 className="page-title">الدليل المحاسبي</h1>
+          <p className="page-sub">كل حساباتك مصنفة حسب نوعها</p>
+        </div>
+        <button className="btn btn-ghost" onClick={onAddStandard}>
+          <DownloadCloud size={15} /> تحميل دليل حسابات قياسي
+        </button>
+      </div>
+
+      <form className="card form-row" onSubmit={submit}>
+        <input
+          className="input small"
+          placeholder="الكود"
+          value={form.code}
+          onChange={(e) => setForm({ ...form, code: e.target.value })}
+        />
+        <input
+          className="input"
+          placeholder="اسم الحساب"
+          value={form.name}
+          onChange={(e) => setForm({ ...form, name: e.target.value })}
+        />
+        <select
+          className="input small"
+          value={form.type}
+          onChange={(e) => setForm({ ...form, type: e.target.value, subType: "" })}
+        >
+          {TYPE_ORDER.map((t) => (
+            <option key={t} value={t}>
+              {ACCOUNT_TYPES[t].label}
+            </option>
+          ))}
+        </select>
+        {ACCOUNT_TYPES[form.type].hasCurrent && (
+          <select
+            className="input small"
+            value={form.current ? "1" : "0"}
+            onChange={(e) => setForm({ ...form, current: e.target.value === "1" })}
+          >
+            <option value="1">متداول</option>
+            <option value="0">غير متداول</option>
+          </select>
+        )}
+        {form.type === "asset" && form.current && (
+          <select
+            className="input small"
+            value={form.subType}
+            onChange={(e) => setForm({ ...form, subType: e.target.value })}
+          >
+            <option value="">تصنيف فرعي</option>
+            {Object.entries(ASSET_SUBTYPES).map(([k, v]) => (
+              <option key={k} value={k}>
+                {v}
+              </option>
+            ))}
+          </select>
+        )}
+        {form.type === "expense" && (
+          <select
+            className="input small"
+            value={form.subType}
+            onChange={(e) => setForm({ ...form, subType: e.target.value })}
+          >
+            <option value="operating">مصاريف تشغيلية</option>
+            <option value="cogs">تكلفة بضاعة مباعة</option>
+            <option value="other">غير تشغيلية (تمويل)</option>
+            <option value="tax">ضريبة الدخل</option>
+          </select>
+        )}
+        {form.type === "revenue" && (
+          <select
+            className="input small"
+            value={form.subType}
+            onChange={(e) => setForm({ ...form, subType: e.target.value })}
+          >
+            <option value="operating">ايرادات تشغيلية</option>
+            <option value="other">غير تشغيلية (متفرقة)</option>
+          </select>
+        )}
+        <button className="btn btn-primary" type="submit">
+          <Plus size={16} /> اضافة
+        </button>
+      </form>
+      {err && <div className="error-text">{err}</div>}
+
+      <div className="filter-bar">
+        <button
+          className={`filter-chip ${filterType === "all" ? "active" : ""}`}
+          onClick={() => chooseType("all")}
+        >
+          الكل
+        </button>
+        {TYPE_ORDER.map((t) => (
+          <button
+            key={t}
+            className={`filter-chip type-${t} ${filterType === t ? "active" : ""}`}
+            onClick={() => chooseType(t)}
+          >
+            {ACCOUNT_TYPES[t].label}
+          </button>
+        ))}
+      </div>
+
+      {filterType !== "all" && SUBFILTER_DEFS[filterType].length > 1 && (
+        <div className="filter-bar sub">
+          {SUBFILTER_DEFS[filterType].map((s) => (
+            <button
+              key={s.key}
+              className={`filter-chip sub-chip ${subFilter === s.key ? "active" : ""}`}
+              onClick={() => setSubFilter(s.key)}
+            >
+              {s.label}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {typesToShow.map((t) => {
+        let list = sortByCode(accounts.filter((a) => a.type === t));
+        if (filterType === t && subFilter !== "all") {
+          const def = SUBFILTER_DEFS[t].find((s) => s.key === subFilter);
+          if (def) list = list.filter(def.test);
+        }
+        if (filterType === "all" && list.length === 0) return null;
+        return (
+          <div key={t} className="card account-group">
+            <h2 className="card-title">{ACCOUNT_TYPES[t].label}</h2>
+            {renderAccountsTable(list)}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------
+   اختيار حساب بالبحث (بدل القائمة المنسدلة الطويلة)
+----------------------------------------------------------------*/
+function AccountPicker({ accounts, value, onChange, placeholder = "اختر حساب" }) {
+  const [query, setQuery] = useState("");
+  const [open, setOpen] = useState(false);
+  const wrapRef = useRef(null);
+
+  useEffect(() => {
+    function onClickOutside(e) {
+      if (wrapRef.current && !wrapRef.current.contains(e.target)) {
+        setOpen(false);
+        setQuery("");
+      }
+    }
+    document.addEventListener("mousedown", onClickOutside);
+    return () => document.removeEventListener("mousedown", onClickOutside);
+  }, []);
+
+  const selected = accounts.find((a) => a.id === value);
+  const q = query.trim().toLowerCase();
+  const filtered = q
+    ? accounts.filter((a) => a.code.toLowerCase().includes(q) || a.name.toLowerCase().includes(q))
+    : accounts;
+
+  return (
+    <div className="account-picker" ref={wrapRef}>
+      <input
+        className="input"
+        placeholder={placeholder}
+        value={open ? query : selected ? `${selected.code} - ${selected.name}` : ""}
+        onFocus={() => {
+          setOpen(true);
+          setQuery("");
+        }}
+        onChange={(e) => setQuery(e.target.value)}
+      />
+      {open && (
+        <div className="account-picker-list">
+          {filtered.length === 0 && <div className="account-picker-empty">ماكو نتائج</div>}
+          {filtered.map((a) => (
+            <div
+              key={a.id}
+              className="account-picker-item"
+              onClick={() => {
+                onChange(a.id);
+                setOpen(false);
+                setQuery("");
+              }}
+            >
+              <span className="num">{a.code}</span> - {a.name}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------
+   القيود اليومية (تدعم العملة وسعر الصرف والتوزيع التحليلي)
+----------------------------------------------------------------*/
+function emptyLine() {
+  return { id: uid(), accountId: "", debit: "", credit: "", costCenterId: "", bayan: "" };
+}
+
+function JournalTab({ accounts, entries, costCenters, onAdd, onDelete }) {
+  const [date, setDate] = useState(todayStr());
+  const [desc, setDesc] = useState("");
+  const [currency, setCurrency] = useState("IQD");
+  const [exchangeRate, setExchangeRate] = useState("1");
+  const [lines, setLines] = useState([emptyLine(), emptyLine()]);
+  const [err, setErr] = useState("");
+
+  const totalDebit = lines.reduce((s, l) => s + (Number(l.debit) || 0), 0);
+  const totalCredit = lines.reduce((s, l) => s + (Number(l.credit) || 0), 0);
+  const diff = totalDebit - totalCredit;
+  const rate = Number(exchangeRate) || 1;
+
+  const updateLine = (id, patch) =>
+    setLines(lines.map((l) => (l.id === id ? { ...l, ...patch } : l)));
+
+  const addLine = () => setLines([...lines, emptyLine()]);
+  const removeLine = (id) => setLines(lines.filter((l) => l.id !== id));
+
+  const onCurrencyChange = (val) => {
+    setCurrency(val);
+    setExchangeRate(val === "IQD" ? "1" : "");
+  };
+
+  const submit = (e) => {
+    e.preventDefault();
+    const validLines = lines.filter((l) => l.accountId && (Number(l.debit) > 0 || Number(l.credit) > 0));
+    if (validLines.length < 2) {
+      setErr("لازم القيد يحتوي على سطرين على الاقل");
+      return;
+    }
+    if (Math.abs(diff) > 0.001) {
+      setErr("القيد غير متوازن المدين لازم يساوي الدائن");
+      return;
+    }
+    if (!desc.trim()) {
+      setErr("اكتب وصف مختصر للقيد");
+      return;
+    }
+    if (currency !== "IQD" && (!exchangeRate || Number(exchangeRate) <= 0)) {
+      setErr("اكتب سعر صرف صحيح مقابل الدينار");
+      return;
+    }
+    onAdd({ date, description: desc.trim(), currency, exchangeRate: rate, lines: validLines });
+    setDate(todayStr());
+    setDesc("");
+    setCurrency("IQD");
+    setExchangeRate("1");
+    setLines([emptyLine(), emptyLine()]);
+    setErr("");
+  };
+
+  const accName = (id) => accounts.find((a) => a.id === id)?.name || "—";
+  const ccName = (id) => costCenters.find((c) => c.id === id)?.name || "";
+
+  return (
+    <div className="page">
+      <h1 className="page-title">القيود اليومية</h1>
+      <p className="page-sub">سجل عملياتك المحاسبية بالقيد المزدوج — تدعم العملة وسعر الصرف والتوزيع التحليلي</p>
+
+      <form className="card" onSubmit={submit}>
+        <div className="form-row">
+          <input
+            className="input small"
+            type="date"
+            value={date}
+            onChange={(e) => setDate(e.target.value)}
+          />
+          <input
+            className="input"
+            placeholder="وصف القيد (مثال: تحصيل ذمم مدينة)"
+            value={desc}
+            onChange={(e) => setDesc(e.target.value)}
+          />
+          <select className="input small" value={currency} onChange={(e) => onCurrencyChange(e.target.value)}>
+            {CURRENCIES.map((c) => (
+              <option key={c} value={c}>
+                {c}
+              </option>
+            ))}
+          </select>
+          {currency !== "IQD" && (
+            <input
+              className="input small"
+              type="number"
+              min="0"
+              placeholder="سعر الصرف"
+              value={exchangeRate}
+              onChange={(e) => setExchangeRate(e.target.value)}
+            />
+          )}
+        </div>
+
+        <table className="table line-table">
+          <thead>
+            <tr>
+              <th>الحساب</th>
+              <th>البيان</th>
+              <th>مدين</th>
+              <th>دائن</th>
+              <th>مركز التكلفة</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {lines.map((l) => (
+              <tr key={l.id}>
+                <td>
+                  <AccountPicker
+                    accounts={accounts}
+                    value={l.accountId}
+                    onChange={(id) => updateLine(l.id, { accountId: id })}
+                  />
+                </td>
+                <td>
+                  <input
+                    className="input"
+                    placeholder="بيان تفصيلي (اختياري)"
+                    value={l.bayan}
+                    onChange={(e) => updateLine(l.id, { bayan: e.target.value })}
+                  />
+                </td>
+                <td>
+                  <input
+                    className="input small"
+                    type="number"
+                    min="0"
+                    value={l.debit}
+                    onChange={(e) => updateLine(l.id, { debit: e.target.value, credit: "" })}
+                  />
+                </td>
+                <td>
+                  <input
+                    className="input small"
+                    type="number"
+                    min="0"
+                    value={l.credit}
+                    onChange={(e) => updateLine(l.id, { credit: e.target.value, debit: "" })}
+                  />
+                </td>
+                <td>
+                  <select
+                    className="input small"
+                    value={l.costCenterId}
+                    onChange={(e) => updateLine(l.id, { costCenterId: e.target.value })}
+                  >
+                    <option value="">بدون</option>
+                    {costCenters.map((c) => (
+                      <option key={c.id} value={c.id}>
+                        {c.name}
+                      </option>
+                    ))}
+                  </select>
+                </td>
+                <td>
+                  <button type="button" className="icon-btn" onClick={() => removeLine(l.id)}>
+                    <X size={15} />
+                  </button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+          <tfoot>
+            <tr>
+              <td className="muted">المجموع ({currency})</td>
+              <td></td>
+              <td className="num double-rule">{fmt(totalDebit)}</td>
+              <td className="num double-rule">{fmt(totalCredit)}</td>
+              <td colSpan={2}></td>
+            </tr>
+          </tfoot>
+        </table>
+
+        <div className="journal-actions">
+          <button type="button" className="btn btn-ghost" onClick={addLine}>
+            <Plus size={15} /> اضافة سطر
+          </button>
+          <span className={`diff-tag ${Math.abs(diff) < 0.001 ? "ok" : "off"}`}>
+            {Math.abs(diff) < 0.001 ? "متوازن" : `الفرق: ${fmt(Math.abs(diff))}`}
+          </span>
+          <button className="btn btn-primary" type="submit">
+            حفظ القيد
+          </button>
+        </div>
+        {err && <div className="error-text">{err}</div>}
+      </form>
+
+      <div className="card">
+        <table className="table">
+          <thead>
+            <tr>
+              <th>التاريخ</th>
+              <th>الوصف</th>
+              <th>التفاصيل</th>
+              <th>العملة</th>
+              <th>المبلغ</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {[...entries].reverse().map((e) => {
+              const tot = e.lines.reduce((s, l) => s + (Number(l.debit) || 0), 0);
+              return (
+                <tr key={e.id}>
+                  <td className="num">{e.date}</td>
+                  <td>{e.description}</td>
+                  <td className="muted small-text">
+                    {e.lines
+                      .map(
+                        (l) =>
+                          `${accName(l.accountId)} ${l.debit ? "مدين" : "دائن"}${
+                            l.bayan ? " - " + l.bayan : ""
+                          }${l.costCenterId ? " (" + ccName(l.costCenterId) + ")" : ""}`
+                      )
+                      .join(" / ")}
+                  </td>
+                  <td className="muted">{e.currency || "IQD"}</td>
+                  <td>
+                    <Num value={tot} />
+                  </td>
+                  <td>
+                    <button className="icon-btn" onClick={() => onDelete(e.id)}>
+                      <Trash2 size={15} />
+                    </button>
+                  </td>
+                </tr>
+              );
+            })}
+            {entries.length === 0 && (
+              <tr>
+                <td colSpan={6} className="empty">ماكو قيود مسجلة بعد</td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------
+   دفتر الاستاذ
+----------------------------------------------------------------*/
+function LedgerTab({ accounts, entries }) {
+  const [accountId, setAccountId] = useState(accounts[0]?.id || "");
+
+  useEffect(() => {
+    if (!accountId && accounts.length) setAccountId(accounts[0].id);
+  }, [accounts, accountId]);
+
+  const account = accounts.find((a) => a.id === accountId);
+  const normal = account ? ACCOUNT_TYPES[account.type].normal : "debit";
+
+  const rows = useMemo(() => {
+    if (!accountId) return [];
+    let running = 0;
+    return entries
+      .filter((e) => e.lines.some((l) => l.accountId === accountId))
+      .sort((a, b) => a.date.localeCompare(b.date))
+      .map((e) => {
+        const matchingLines = e.lines.filter((l) => l.accountId === accountId);
+        const rate = Number(e.exchangeRate) || 1;
+        const debit = matchingLines.reduce((s, l) => s + (Number(l.debit) || 0), 0) * rate;
+        const credit = matchingLines.reduce((s, l) => s + (Number(l.credit) || 0), 0) * rate;
+        running += normal === "debit" ? debit - credit : credit - debit;
+        const bayan = matchingLines.map((l) => l.bayan).filter(Boolean).join(" / ");
+        return { date: e.date, description: e.description, bayan, debit, credit, running, currency: e.currency };
+      });
+  }, [accountId, entries, normal]);
+
+  return (
+    <div className="page">
+      <h1 className="page-title">دفتر الاستاذ</h1>
+      <p className="page-sub">حركة كل حساب على حدة مع الرصيد التراكمي بمعادل الدينار العراقي</p>
+
+      <div className="card form-row">
+        <AccountPicker accounts={accounts} value={accountId} onChange={setAccountId} placeholder="دور على حساب" />
+      </div>
+
+      <div className="card">
+        <table className="table">
+          <thead>
+            <tr>
+              <th>التاريخ</th>
+              <th>الوصف</th>
+              <th>البيان المحاسبي</th>
+              <th>مدين</th>
+              <th>دائن</th>
+              <th>الرصيد</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r, i) => (
+              <tr key={i}>
+                <td className="num">{r.date}</td>
+                <td>
+                  {r.description}
+                  {r.currency && r.currency !== "IQD" && <span className="muted small-text"> ({r.currency})</span>}
+                </td>
+                <td className="muted small-text">{r.bayan || "—"}</td>
+                <td className="num">{r.debit ? fmt(r.debit) : ""}</td>
+                <td className="num">{r.credit ? fmt(r.credit) : ""}</td>
+                <td>
+                  <Num value={r.running} />
+                </td>
+              </tr>
+            ))}
+            {rows.length === 0 && (
+              <tr>
+                <td colSpan={6} className="empty">ماكو حركة على هذا الحساب</td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------
+   ميزان المراجعة
+----------------------------------------------------------------*/
+function TrialBalanceTab({ accounts, balances, entries }) {
+  const [showAll, setShowAll] = useState(false);
+  const usedIds = useMemo(() => getUsedAccountIds(entries), [entries]);
+  const sorted = [...accounts]
+    .filter((a) => showAll || usedIds.has(a.id))
+    .sort((a, b) => a.code.localeCompare(b.code, "en", { numeric: true }));
+  let totalDebit = 0;
+  let totalCredit = 0;
+
+  const rows = sorted.map((a) => {
+    const net = balances[a.id]?.net || 0;
+    const normal = ACCOUNT_TYPES[a.type].normal;
+    const debitCol = normal === "debit" ? Math.max(net, 0) : net < 0 ? -net : 0;
+    const creditCol = normal === "credit" ? Math.max(net, 0) : net < 0 ? -net : 0;
+    totalDebit += debitCol;
+    totalCredit += creditCol;
+    return { ...a, debitCol, creditCol };
+  });
+
+  return (
+    <div className="page">
+      <div className="page-head-row">
+        <div>
+          <h1 className="page-title">ميزان المراجعة</h1>
+          <p className="page-sub">مجاميع كل الحسابات للتأكد ان المدين يساوي الدائن (بالدينار العراقي)</p>
+        </div>
+        <button className="btn btn-ghost" onClick={() => setShowAll((v) => !v)}>
+          {showAll ? <X size={15} /> : <ListTree size={15} />}
+          {showAll ? "اخفاء الحسابات الفارغة" : "اظهار كل الحسابات"}
+        </button>
+      </div>
+
+      <div className="card">
+        <table className="table">
+          <thead>
+            <tr>
+              <th>الكود</th>
+              <th>اسم الحساب</th>
+              <th>مدين</th>
+              <th>دائن</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r) => (
+              <tr key={r.id}>
+                <td className="num">{r.code}</td>
+                <td>{r.name}</td>
+                <td className="num">{r.debitCol ? fmt(r.debitCol) : ""}</td>
+                <td className="num">{r.creditCol ? fmt(r.creditCol) : ""}</td>
+              </tr>
+            ))}
+            {rows.length === 0 && (
+              <tr>
+                <td colSpan={4} className="empty">ماكو حسابات عليها حركة لحد الحين</td>
+              </tr>
+            )}
+          </tbody>
+          <tfoot>
+            <tr>
+              <td colSpan={2} className="muted">الاجمالي</td>
+              <td className="num double-rule">{fmt(totalDebit)}</td>
+              <td className="num double-rule">{fmt(totalCredit)}</td>
+            </tr>
+          </tfoot>
+        </table>
+      </div>
+
+      <div className={`balance-status standalone ${Math.abs(totalDebit - totalCredit) < 1 ? "ok" : "off"}`}>
+        {Math.abs(totalDebit - totalCredit) < 1 ? (
+          <>
+            <CheckCircle2 size={16} /> الميزان متوازن
+          </>
+        ) : (
+          <>
+            <AlertCircle size={16} /> الميزان غير متوازن راجع قيودك
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------
+   القوائم المالية
+----------------------------------------------------------------*/
+function StatementsTab({ accounts, balances, entries }) {
+  const [showAll, setShowAll] = useState(false);
+  const usedIds = useMemo(() => getUsedAccountIds(entries), [entries]);
+  const sortByCode = (list) => [...list].sort((a, b) => a.code.localeCompare(b.code, "en", { numeric: true }));
+  const visible = (list) => (showAll ? list : list.filter((a) => usedIds.has(a.id)));
+  const net = (a) => balances[a.id]?.net || 0;
+  const sumOf = (list) => list.reduce((s, a) => s + net(a), 0);
+
+  const explainContribs = (contribs) => {
+    const used = contribs.filter((c) => c.amount !== 0);
+    if (used.length === 0) return "";
+    const inc = used.filter((c) => c.amount > 0).map((c) => c.name);
+    const dec = used.filter((c) => c.amount < 0).map((c) => c.name);
+    const parts = [];
+    if (inc.length) parts.push(`زادت من ${inc.join("، ")}`);
+    if (dec.length) parts.push(`نقصت بسبب ${dec.join("، ")}`);
+    return parts.join(" — ");
+  };
+
+  const explainSection = (list) => explainContribs(visible(list).map((a) => ({ name: a.name, amount: net(a) })));
+
+  const Hint = ({ text }) =>
+    text ? <div className="statement-hint">{text}</div> : null;
+
+  // ---------- قائمة الدخل (متعددة الخطوات) ----------
+  const allOperatingRevenueAccs = sortByCode(
+    accounts.filter((a) => a.type === "revenue" && (a.subType === "operating" || !a.subType))
+  );
+  const salesAccs = allOperatingRevenueAccs.filter((a) => a.group !== "service");
+  const serviceAccs = allOperatingRevenueAccs.filter((a) => a.group === "service");
+  const otherRevenueAccs = sortByCode(accounts.filter((a) => a.type === "revenue" && a.subType === "other"));
+  const cogsAccs = sortByCode(accounts.filter((a) => a.type === "expense" && a.subType === "cogs"));
+  const operatingExpAccs = sortByCode(
+    accounts.filter((a) => a.type === "expense" && (a.subType === "operating" || !a.subType))
+  );
+  const otherExpAccs = sortByCode(accounts.filter((a) => a.type === "expense" && a.subType === "other"));
+  const taxAccs = sortByCode(accounts.filter((a) => a.type === "expense" && a.subType === "tax"));
+
+  const netSales = sumOf(salesAccs);
+  const netServices = sumOf(serviceAccs);
+  const operatingRevenue = netSales + netServices;
+  const otherRevenue = sumOf(otherRevenueAccs);
+  const cogs = sumOf(cogsAccs);
+  const operatingExp = sumOf(operatingExpAccs);
+  const otherExp = sumOf(otherExpAccs);
+  const taxExp = sumOf(taxAccs);
+
+  const grossProfit = operatingRevenue - cogs;
+  const operatingProfit = grossProfit - operatingExp;
+  const profitBeforeTax = operatingProfit + otherRevenue - otherExp;
+  const netProfit = profitBeforeTax - taxExp;
+
+  // ---------- قائمة المركز المالي ----------
+  const currentAssets = sortByCode(accounts.filter((a) => a.type === "asset" && a.current));
+  const nonCurrentAssets = sortByCode(accounts.filter((a) => a.type === "asset" && !a.current));
+  const currentLiab = sortByCode(accounts.filter((a) => a.type === "liability" && a.current));
+  const nonCurrentLiab = sortByCode(accounts.filter((a) => a.type === "liability" && !a.current));
+  const equityAccs = sortByCode(accounts.filter((a) => a.type === "equity"));
+
+  const totalCurrentAssets = sumOf(currentAssets);
+  const totalNonCurrentAssets = sumOf(nonCurrentAssets);
+  const totalAssets = totalCurrentAssets + totalNonCurrentAssets;
+
+  const totalCurrentLiab = sumOf(currentLiab);
+  const totalNonCurrentLiab = sumOf(nonCurrentLiab);
+  const totalLiab = totalCurrentLiab + totalNonCurrentLiab;
+
+  const totalEquityBase = sumOf(equityAccs);
+  const totalEquity = totalEquityBase + netProfit;
+
+  const Row = ({ a }) => (
+    <div className="statement-row" key={a.id}>
+      <span>{a.name}</span>
+      <Num value={net(a)} />
+    </div>
+  );
+
+  return (
+    <div className="page">
+      <div className="page-head-row">
+        <div>
+          <h1 className="page-title">القوائم المالية</h1>
+          <p className="page-sub">قائمة الدخل متعددة الخطوات وقائمة المركز المالي مقسمة متداول / غير متداول</p>
+        </div>
+        <button className="btn btn-ghost" onClick={() => setShowAll((v) => !v)}>
+          {showAll ? <X size={15} /> : <ListTree size={15} />}
+          {showAll ? "اخفاء الحسابات الفارغة" : "اظهار كل الحسابات"}
+        </button>
+      </div>
+
+      <div className="statements-grid">
+        <div className="card">
+          <h2 className="card-title">قائمة الدخل</h2>
+
+          <div className="statement-section">
+            <div className="statement-label">المبيعات</div>
+            {visible(salesAccs).map((a) => <Row a={a} key={a.id} />)}
+            <div className="statement-row subtotal small">
+              <span>صافي المبيعات</span>
+              <Num value={netSales} />
+            </div>
+            <Hint text={explainSection(salesAccs)} />
+          </div>
+
+          {visible(serviceAccs).length > 0 && (
+            <div className="statement-section">
+              <div className="statement-label">ايرادات الخدمات</div>
+              {visible(serviceAccs).map((a) => <Row a={a} key={a.id} />)}
+              <div className="statement-row subtotal small">
+                <span>صافي ايرادات الخدمات</span>
+                <Num value={netServices} />
+              </div>
+              <Hint text={explainSection(serviceAccs)} />
+            </div>
+          )}
+
+          <div className="statement-section">
+            <div className="statement-label">تكلفة البضاعة المباعة</div>
+            {visible(cogsAccs).map((a) => <Row a={a} key={a.id} />)}
+            <div className="statement-row subtotal small">
+              <span>اجمالي تكلفة البضاعة المباعة</span>
+              <Num value={cogs} />
+            </div>
+          </div>
+          <div className="statement-row subtotal">
+            <span>مجمل الربح (Gross Profit)</span>
+            <Num value={grossProfit} />
+          </div>
+          <Hint
+            text={`صافي المبيعات${visible(serviceAccs).length > 0 ? " + صافي ايرادات الخدمات" : ""} − اجمالي تكلفة البضاعة المباعة`}
+          />
+
+          <div className="statement-section">
+            <div className="statement-label">المصاريف التشغيلية</div>
+            {visible(operatingExpAccs).map((a) => <Row a={a} key={a.id} />)}
+            <div className="statement-row subtotal small">
+              <span>اجمالي المصاريف التشغيلية</span>
+              <Num value={operatingExp} />
+            </div>
+            <Hint text={explainSection(operatingExpAccs)} />
+          </div>
+          <div className="statement-row subtotal">
+            <span>الربح التشغيلي (Operating Profit)</span>
+            <Num value={operatingProfit} />
+          </div>
+          <Hint text="مجمل الربح − اجمالي المصاريف التشغيلية" />
+
+          {(visible(otherRevenueAccs).length > 0 || visible(otherExpAccs).length > 0) && (
+            <div className="statement-section">
+              <div className="statement-label">ايرادات ومصاريف غير تشغيلية</div>
+              {visible(otherRevenueAccs).map((a) => <Row a={a} key={a.id} />)}
+              {visible(otherExpAccs).map((a) => <Row a={a} key={a.id} />)}
+              <div className="statement-row subtotal small">
+                <span>صافي البنود غير التشغيلية</span>
+                <Num value={otherRevenue - otherExp} />
+              </div>
+              <Hint
+                text={explainContribs([
+                  ...visible(otherRevenueAccs).map((a) => ({ name: a.name, amount: net(a) })),
+                  ...visible(otherExpAccs).map((a) => ({ name: a.name, amount: -net(a) })),
+                ])}
+              />
+            </div>
+          )}
+          <div className="statement-row subtotal">
+            <span>الربح قبل الضريبة</span>
+            <Num value={profitBeforeTax} />
+          </div>
+          <Hint text="الربح التشغيلي + صافي البنود غير التشغيلية" />
+
+          <div className="statement-section">
+            <div className="statement-label">ضريبة الدخل</div>
+            {visible(taxAccs).map((a) => <Row a={a} key={a.id} />)}
+          </div>
+          <div className={`statement-row net ${netProfit >= 0 ? "good" : "bad"}`}>
+            <span>{netProfit >= 0 ? "صافي الربح بعد الضريبة" : "صافي الخسارة بعد الضريبة"}</span>
+            <Num value={Math.abs(netProfit)} />
+          </div>
+          <Hint text="الربح قبل الضريبة − ضريبة الدخل" />
+        </div>
+
+        <div className="card">
+          <h2 className="card-title">قائمة المركز المالي</h2>
+
+          <div className="statement-section">
+            <div className="statement-label">الاصول المتداولة</div>
+            {visible(currentAssets).map((a) => <Row a={a} key={a.id} />)}
+            <div className="statement-row subtotal small">
+              <span>اجمالي الاصول المتداولة</span>
+              <Num value={totalCurrentAssets} />
+            </div>
+          </div>
+          <div className="statement-section">
+            <div className="statement-label">الاصول غير المتداولة</div>
+            {visible(nonCurrentAssets).map((a) => <Row a={a} key={a.id} />)}
+            <div className="statement-row subtotal small">
+              <span>اجمالي الاصول غير المتداولة</span>
+              <Num value={totalNonCurrentAssets} />
+            </div>
+          </div>
+          <div className="statement-row total">
+            <span>اجمالي الاصول</span>
+            <Num value={totalAssets} />
+          </div>
+
+          <div className="statement-section" style={{ marginTop: 14 }}>
+            <div className="statement-label">الخصوم المتداولة</div>
+            {visible(currentLiab).map((a) => <Row a={a} key={a.id} />)}
+            <div className="statement-row subtotal small">
+              <span>اجمالي الخصوم المتداولة</span>
+              <Num value={totalCurrentLiab} />
+            </div>
+          </div>
+          <div className="statement-section">
+            <div className="statement-label">الخصوم غير المتداولة</div>
+            {visible(nonCurrentLiab).map((a) => <Row a={a} key={a.id} />)}
+            <div className="statement-row subtotal small">
+              <span>اجمالي الخصوم غير المتداولة</span>
+              <Num value={totalNonCurrentLiab} />
+            </div>
+          </div>
+          <div className="statement-row total">
+            <span>اجمالي الخصوم</span>
+            <Num value={totalLiab} />
+          </div>
+
+          <div className="statement-section">
+            <div className="statement-label">حقوق الملكية</div>
+            {visible(equityAccs).map((a) => <Row a={a} key={a.id} />)}
+            <div className="statement-row">
+              <span>صافي ربح الفترة</span>
+              <Num value={netProfit} />
+            </div>
+            <div className="statement-row subtotal small">
+              <span>اجمالي حقوق الملكية</span>
+              <Num value={totalEquity} />
+            </div>
+          </div>
+
+          <div className="statement-row net">
+            <span>الخصوم + حقوق الملكية</span>
+            <Num value={totalLiab + totalEquity} />
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------
+   التوزيع التحليلي (مراكز التكلفة)
+----------------------------------------------------------------*/
+function AnalyticsTab({ accounts, entries, costCenters, onAddCostCenter, onDeleteCostCenter }) {
+  const [name, setName] = useState("");
+
+  const submit = (e) => {
+    e.preventDefault();
+    if (!name.trim()) return;
+    onAddCostCenter(name.trim());
+    setName("");
+  };
+
+  const accountById = (id) => accounts.find((a) => a.id === id);
+
+  const breakdown = useMemo(() => {
+    const map = {};
+    costCenters.forEach((c) => (map[c.id] = { revenue: 0, expense: 0 }));
+    entries.forEach((e) => {
+      const rate = Number(e.exchangeRate) || 1;
+      e.lines.forEach((l) => {
+        if (!l.costCenterId || !map[l.costCenterId]) return;
+        const acc = accountById(l.accountId);
+        if (!acc) return;
+        if (acc.type === "revenue") {
+          map[l.costCenterId].revenue += (Number(l.credit) || 0) * rate - (Number(l.debit) || 0) * rate;
+        } else if (acc.type === "expense") {
+          map[l.costCenterId].expense += (Number(l.debit) || 0) * rate - (Number(l.credit) || 0) * rate;
+        }
+      });
+    });
+    return map;
+  }, [entries, costCenters, accounts]);
+
+  return (
+    <div className="page">
+      <h1 className="page-title">التوزيع التحليلي</h1>
+      <p className="page-sub">وزع قيودك على مراكز تكلفة (فروع، مشاريع، خدمات) وشوف اداء كل وحدة على حدة</p>
+
+      <form className="card form-row" onSubmit={submit}>
+        <input
+          className="input"
+          placeholder="اسم مركز التكلفة (مثال: فرع المنصور)"
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+        />
+        <button className="btn btn-primary" type="submit">
+          <Plus size={16} /> اضافة مركز
+        </button>
+      </form>
+
+      <div className="card">
+        <table className="table">
+          <thead>
+            <tr>
+              <th>مركز التكلفة</th>
+              <th>الايرادات</th>
+              <th>المصاريف</th>
+              <th>الصافي</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {costCenters.map((c) => {
+              const b = breakdown[c.id] || { revenue: 0, expense: 0 };
+              const net = b.revenue - b.expense;
+              return (
+                <tr key={c.id}>
+                  <td>{c.name}</td>
+                  <td className="num">{fmt(b.revenue)}</td>
+                  <td className="num">{fmt(b.expense)}</td>
+                  <td>
+                    <Num value={net} className={net >= 0 ? "" : ""} />
+                  </td>
+                  <td>
+                    <button className="icon-btn" onClick={() => onDeleteCostCenter(c.id)}>
+                      <Trash2 size={15} />
+                    </button>
+                  </td>
+                </tr>
+              );
+            })}
+            {costCenters.length === 0 && (
+              <tr>
+                <td colSpan={5} className="empty">ضيف مركز تكلفة وحدد بيه قيودك حتى تشوف التحليل</td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------
+   التحليل المالي — نسب السيولة والربحية والنشاط والرفع المالي
+----------------------------------------------------------------*/
+function RatiosTab({ accounts, balances, totalsByType, netIncome }) {
+  const sumWhere = (pred) =>
+    accounts.filter(pred).reduce((s, a) => s + (balances[a.id]?.net || 0), 0);
+
+  const currentAssets = sumWhere((a) => a.type === "asset" && a.current);
+  const currentLiab = sumWhere((a) => a.type === "liability" && a.current);
+  const inventory = sumWhere((a) => a.type === "asset" && a.current && a.subType === "inventory");
+  const receivables = sumWhere((a) => a.type === "asset" && a.current && a.subType === "receivable");
+  const cogs = sumWhere((a) => a.type === "expense" && a.subType === "cogs");
+
+  const totalAssets = totalsByType.asset;
+  const totalLiab = totalsByType.liability;
+  const totalEquity = totalsByType.equity;
+  const revenue = totalsByType.revenue;
+
+  const operatingRevenue = sumWhere((a) => a.type === "revenue" && a.subType !== "other");
+  const operatingExpenses = sumWhere((a) => a.type === "expense" && a.subType === "operating");
+  const operatingIncome = operatingRevenue - cogs - operatingExpenses;
+  const operatingMargin = operatingRevenue > 0 ? (operatingIncome / operatingRevenue) * 100 : null;
+
+  const currentRatio = currentLiab > 0 ? currentAssets / currentLiab : null;
+  const quickRatio = currentLiab > 0 ? (currentAssets - inventory) / currentLiab : null;
+  const workingCapital = currentAssets - currentLiab;
+
+  const grossProfit = revenue - cogs;
+  const grossMargin = revenue > 0 ? (grossProfit / revenue) * 100 : null;
+  const netMargin = revenue > 0 ? (netIncome / revenue) * 100 : null;
+  const roa = totalAssets > 0 ? (netIncome / totalAssets) * 100 : null;
+  const roe = totalEquity > 0 ? (netIncome / totalEquity) * 100 : null;
+
+  const inventoryTurnover = inventory > 0 ? cogs / inventory : null;
+  const receivablesTurnover = receivables > 0 ? revenue / receivables : null;
+  const avgCollectionDays = receivablesTurnover ? 365 / receivablesTurnover : null;
+
+  const debtRatio = totalAssets > 0 ? (totalLiab / totalAssets) * 100 : null;
+  const debtToEquity = totalEquity > 0 ? (totalLiab / totalEquity) * 100 : null;
+
+  const fmtRatio = (v, suffix = "") => (v === null || !isFinite(v) ? "—" : `${v.toFixed(2)}${suffix}`);
+
+  return (
+    <div className="page">
+      <h1 className="page-title">التحليل المالي</h1>
+      <p className="page-sub">كل النسب الاساسية محسوبة تلقائيا من قوائمك المالية الحالية</p>
+
+      <h2 className="section-title">نسب السيولة</h2>
+      <div className="ratio-grid">
+        <RatioCard title="نسبة التداول" value={fmtRatio(currentRatio)} desc="اصول متداولة ÷ خصوم متداولة" />
+        <RatioCard title="النسبة السريعة" value={fmtRatio(quickRatio)} desc="(اصول متداولة - مخزون) ÷ خصوم متداولة" />
+        <RatioCard title="رأس المال العامل" value={fmt(workingCapital) + " د.ع"} desc="اصول متداولة - خصوم متداولة" />
+      </div>
+
+      <h2 className="section-title">نسب الربحية</h2>
+      <div className="ratio-grid">
+        <RatioCard title="هامش مجمل الربح" value={fmtRatio(grossMargin, "%")} desc="(الايرادات - تكلفة البضاعة) ÷ الايرادات" />
+        <RatioCard title="هامش الربح التشغيلي" value={fmtRatio(operatingMargin, "%")} desc="(الايرادات التشغيلية - تكلفة البضاعة - مصاريف تشغيلية) ÷ الايرادات التشغيلية" />
+        <RatioCard title="هامش صافي الربح" value={fmtRatio(netMargin, "%")} desc="صافي الربح ÷ الايرادات" />
+        <RatioCard title="العائد على الاصول ROA" value={fmtRatio(roa, "%")} desc="صافي الربح ÷ اجمالي الاصول" />
+        <RatioCard title="العائد على حقوق الملكية ROE" value={fmtRatio(roe, "%")} desc="صافي الربح ÷ حقوق الملكية" />
+      </div>
+
+      <h2 className="section-title">نسب النشاط</h2>
+      <div className="ratio-grid">
+        <RatioCard title="معدل دوران المخزون" value={fmtRatio(inventoryTurnover, " مرة")} desc="تكلفة البضاعة ÷ المخزون" />
+        <RatioCard title="معدل دوران الذمم" value={fmtRatio(receivablesTurnover, " مرة")} desc="الايرادات ÷ الذمم المدينة" />
+        <RatioCard title="متوسط فترة التحصيل" value={fmtRatio(avgCollectionDays, " يوم")} desc="365 ÷ معدل دوران الذمم" />
+      </div>
+
+      <h2 className="section-title">نسب الرفع المالي</h2>
+      <div className="ratio-grid">
+        <RatioCard title="نسبة الدين الى الاصول" value={fmtRatio(debtRatio, "%")} desc="اجمالي الخصوم ÷ اجمالي الاصول" />
+        <RatioCard title="نسبة الدين الى حقوق الملكية" value={fmtRatio(debtToEquity, "%")} desc="اجمالي الخصوم ÷ حقوق الملكية" />
+      </div>
+
+      <div className="card note-card">
+        لتفعيل بعض النسب (مثل دوران المخزون والذمم) لازم تحدد التصنيف الفرعي للحسابات (نقدية / ذمم / مخزون) من تبويب الدليل المحاسبي
+      </div>
+    </div>
+  );
+}
+
+function RatioCard({ title, value, desc }) {
+  return (
+    <div className="card ratio-card">
+      <div className="ratio-title">{title}</div>
+      <div className="ratio-value">{value}</div>
+      <div className="ratio-desc">{desc}</div>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------
+   التنسيق
+----------------------------------------------------------------*/
+const CSS = `
+@import url('https://fonts.googleapis.com/css2?family=Amiri:wght@400;700&family=Tajawal:wght@400;500;700;900&family=IBM+Plex+Mono:wght@500;600&display=swap');
+
+.app {
+  --bg: #14171c;
+  --surface: #1b1f26;
+  --surface-2: #232830;
+  --line: #2d333d;
+  --gold: #c9a227;
+  --gold-soft: #e0c264;
+  --ink: #ece8de;
+  --muted: #8a8f98;
+  --good: #5fa379;
+  --bad: #c0584f;
+  font-family: 'Tajawal', sans-serif;
+  background: var(--bg);
+  color: var(--ink);
+  min-height: 100vh;
+  display: flex;
+  width: 100%;
+}
+.app * { box-sizing: border-box; }
+.app button, .app input, .app select { font-family: inherit; }
+.app :focus-visible { outline: 2px solid var(--gold); outline-offset: 2px; }
+
+.loading-screen {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 10px; width: 100%; height: 100vh; color: var(--muted);
+}
+.spin { animation: spin 1s linear infinite; color: var(--gold); }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.sidebar {
+  width: 230px; flex-shrink: 0; background: var(--surface);
+  border-left: 1px solid var(--line);
+  display: flex; flex-direction: column; padding: 20px 14px;
+  height: 100vh; position: sticky; top: 0;
+}
+.brand { display: flex; align-items: center; gap: 10px; padding: 4px 8px 22px; }
+.brand-mark {
+  font-family: 'Amiri', serif; font-size: 22px; color: var(--bg); background: var(--gold);
+  width: 36px; height: 36px; border-radius: 8px; display: flex; align-items: center; justify-content: center;
+}
+.brand-title { font-family: 'Amiri', serif; font-size: 17px; font-weight: 700; color: var(--ink); }
+.brand-sub { font-size: 11px; color: var(--muted); }
+
+.nav { display: flex; flex-direction: column; gap: 3px; flex: 1; overflow-y: auto; }
+.nav-item {
+  display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-radius: 8px;
+  background: transparent; border: none; color: var(--muted); font-size: 14px; cursor: pointer;
+  text-align: right; transition: background .15s, color .15s;
+}
+.nav-item:hover { background: var(--surface-2); color: var(--ink); }
+.nav-item.active { background: var(--surface-2); color: var(--gold-soft); font-weight: 700; }
+
+.reset-btn {
+  display: flex; align-items: center; gap: 6px; justify-content: center;
+  background: transparent; border: 1px solid var(--line); color: var(--muted);
+  padding: 9px; border-radius: 8px; font-size: 12px; cursor: pointer; margin-top: 8px;
+}
+.reset-btn:hover { color: var(--gold-soft); border-color: var(--gold); }
+.reset-btn.danger:hover { color: var(--bad); border-color: var(--bad); }
+
+.content { flex: 1; padding: 28px 34px; max-width: 1150px; overflow-x: hidden; }
+.page-head-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.page-title { font-family: 'Amiri', serif; font-size: 26px; font-weight: 700; margin: 0 0 4px; color: var(--ink); }
+.page-sub { color: var(--muted); font-size: 13.5px; margin: 0 0 22px; }
+.section-title { font-family: 'Amiri', serif; font-size: 16px; color: var(--gold-soft); margin: 22px 0 10px; }
+
+.card {
+  background: var(--surface); border: 1px solid var(--line); border-radius: 12px;
+  padding: 18px; margin-bottom: 18px;
+}
+.card-title { font-family: 'Amiri', serif; font-size: 18px; margin: 0 0 14px; color: var(--gold-soft); }
+
+.stat-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 20px; }
+.stat-card { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 16px; }
+.stat-card.good { border-color: var(--good); }
+.stat-card.bad { border-color: var(--bad); }
+.stat-value { font-family: 'IBM Plex Mono', monospace; direction: ltr; font-size: 22px; font-weight: 600; color: var(--gold-soft); }
+.stat-suffix { font-family: 'Tajawal', sans-serif; font-size: 12px; color: var(--muted); }
+.stat-label { font-size: 12.5px; color: var(--muted); margin-top: 4px; }
+
+.balance-check-row { display: flex; justify-content: space-between; padding: 6px 0; font-size: 14px; }
+.balance-status {
+  display: flex; align-items: center; gap: 7px; font-size: 13.5px; padding: 9px 0 0; font-weight: 700;
+}
+.balance-status.ok { color: var(--good); }
+.balance-status.off { color: var(--bad); }
+.balance-status.standalone { padding: 4px 4px; }
+
+.form-row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+.input {
+  background: var(--surface-2); border: 1px solid var(--line); color: var(--ink);
+  border-radius: 8px; padding: 9px 12px; font-size: 13.5px; flex: 1; min-width: 140px;
+}
+.input.small { flex: none; width: 120px; }
+.error-text { color: var(--bad); font-size: 12.5px; margin: -8px 0 14px; }
+
+.btn {
+  display: flex; align-items: center; gap: 6px; border: none; border-radius: 8px;
+  padding: 9px 16px; font-size: 13.5px; cursor: pointer; font-weight: 700;
+}
+.btn-primary { background: var(--gold); color: #1c1c1c; }
+.btn-primary:hover { background: var(--gold-soft); }
+.btn-ghost { background: transparent; border: 1px solid var(--line); color: var(--ink); }
+.btn-ghost:hover { border-color: var(--gold); color: var(--gold-soft); }
+
+.table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+.table th { text-align: right; color: var(--muted); font-weight: 500; font-size: 12px; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+.table td { padding: 9px 10px; border-bottom: 1px solid var(--line); }
+.table tbody tr:hover { background: var(--surface-2); }
+.table tfoot td { padding-top: 12px; font-weight: 700; }
+.num { font-family: 'IBM Plex Mono', monospace; direction: ltr; display: inline-block; }
+.double-rule { border-top: 3px double var(--gold); padding-top: 8px !important; color: var(--gold-soft); }
+.muted { color: var(--muted); }
+.small-text { font-size: 11.5px; }
+.empty { text-align: center; color: var(--muted); padding: 24px !important; }
+
+.filter-bar { display: flex; gap: 8px; flex-wrap: wrap; margin: 4px 0 18px; }
+.filter-bar.sub { margin-top: -10px; padding-right: 4px; }
+.filter-chip {
+  background: var(--surface); border: 1px solid var(--line); color: var(--muted);
+  padding: 7px 16px; border-radius: 20px; font-size: 12.5px; cursor: pointer; font-weight: 700;
+  transition: all .15s;
+}
+.filter-chip.sub-chip { padding: 5px 13px; font-size: 11.5px; font-weight: 500; border-style: dashed; }
+.filter-chip:hover { border-color: var(--gold); color: var(--ink); }
+.filter-chip.active { background: var(--gold); color: #1c1c1c; border-color: var(--gold); }
+.account-group { margin-bottom: 18px; }
+
+.badge { font-size: 11px; padding: 3px 9px; border-radius: 20px; border: 1px solid var(--line); }
+.type-asset { color: #8fb8e0; border-color: #8fb8e066; }
+.type-liability { color: #e0a88f; border-color: #e0a88f66; }
+.type-equity { color: var(--gold-soft); border-color: #c9a22766; }
+.type-revenue { color: var(--good); border-color: #5fa37966; }
+.type-expense { color: var(--bad); border-color: #c0584f66; }
+
+.icon-btn { background: transparent; border: none; color: var(--muted); cursor: pointer; padding: 4px; }
+.icon-btn:hover { color: var(--bad); }
+
+.line-table input, .line-table select { min-width: 0; }
+.account-picker { position: relative; min-width: 160px; }
+.account-picker-list {
+  position: absolute; top: calc(100% + 4px); right: 0; left: 0; z-index: 30;
+  background: var(--surface-2); border: 1px solid var(--gold); border-radius: 8px;
+  max-height: 220px; overflow-y: auto; box-shadow: 0 8px 24px rgba(0,0,0,.4);
+}
+.account-picker-item { padding: 8px 12px; font-size: 13px; cursor: pointer; border-bottom: 1px solid var(--line); }
+.account-picker-item:last-child { border-bottom: none; }
+.account-picker-item:hover { background: var(--bg); color: var(--gold-soft); }
+.account-picker-empty { padding: 10px 12px; font-size: 12.5px; color: var(--muted); }
+.journal-actions { display: flex; align-items: center; gap: 12px; margin-top: 14px; }
+.diff-tag { font-size: 12.5px; font-weight: 700; flex: 1; }
+.diff-tag.ok { color: var(--good); }
+.diff-tag.off { color: var(--bad); }
+
+.statements-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+.statement-section { margin-bottom: 14px; }
+.statement-label { font-size: 12px; color: var(--gold-soft); font-weight: 700; margin-bottom: 6px; text-transform: uppercase; letter-spacing: .03em; }
+.statement-row { display: flex; justify-content: space-between; padding: 5px 0; font-size: 13.5px; border-bottom: 1px dashed var(--line); }
+.statement-hint { font-size: 10.5px; color: var(--muted); font-style: italic; margin: -8px 0 12px; line-height: 1.6; opacity: .8; }
+.statement-row.total { font-weight: 700; border-bottom: 1px solid var(--line); border-top: 1px solid var(--line); margin-top: 2px; }
+.statement-row.subtotal { font-weight: 700; color: var(--gold-soft); border-top: 2px solid var(--gold); border-bottom: none; padding-top: 8px; margin: 4px 0 12px; font-size: 14px; }
+.statement-row.subtotal.small { font-size: 12px; color: var(--muted); border-top: 1px dashed var(--line); font-weight: 700; margin: 2px 0 10px; padding-top: 6px; }
+.statement-row.net { font-weight: 700; font-size: 15px; border-top: 3px double var(--gold); border-bottom: none; padding-top: 10px; margin-top: 8px; color: var(--gold-soft); }
+.statement-row.net.good { color: var(--good); }
+.statement-row.net.bad { color: var(--bad); }
+
+.ratio-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-bottom: 8px; }
+.ratio-card { text-align: center; margin-bottom: 0; }
+.ratio-title { font-size: 12.5px; color: var(--muted); margin-bottom: 8px; }
+.ratio-value { font-family: 'IBM Plex Mono', monospace; direction: ltr; display: inline-block; font-size: 24px; font-weight: 700; color: var(--gold-soft); }
+.ratio-desc { font-size: 11px; color: var(--muted); margin-top: 8px; line-height: 1.5; }
+.note-card { font-size: 12.5px; color: var(--muted); text-align: center; margin-top: 18px; }
+
+.toast {
+  position: fixed; bottom: 22px; left: 50%; transform: translateX(-50%);
+  background: var(--surface-2); border: 1px solid var(--line); padding: 10px 18px;
+  border-radius: 9px; font-size: 13px; display: flex; align-items: center; gap: 8px; z-index: 50;
+}
+.toast.ok { color: var(--good); border-color: var(--good); }
+.toast.error { color: var(--bad); border-color: var(--bad); }
+
+@media (max-width: 860px) {
+  .app { flex-direction: column; }
+  .sidebar { width: 100%; height: auto; position: relative; flex-direction: row; align-items: center; padding: 12px; overflow-x: auto; flex-wrap: wrap; }
+  .brand { padding: 0 10px 0 0; }
+  .nav { flex-direction: row; }
+  .nav-item span { display: none; }
+  .reset-btn { width: auto; margin-top: 0; padding: 8px 10px; }
+  .reset-btn span { display: none; }
+  .content { padding: 18px; }
+  .stat-grid { grid-template-columns: repeat(2, 1fr); }
+  .statements-grid { grid-template-columns: 1fr; }
+  .ratio-grid { grid-template-columns: 1fr; }
+}
+`;
+
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<AccountingApp />);
+</script>
+</body>
+</html>
